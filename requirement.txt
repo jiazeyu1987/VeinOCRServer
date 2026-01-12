@@ -1,0 +1,39 @@
+# Python 3.10/3.11 runtime dependencies (Windows)
+#
+# Notes about PaddlePaddle:
+# - CPU: keep `paddlepaddle` as-is.
+# - GPU: replace `paddlepaddle` with the correct `paddlepaddle-gpu` wheel for your CUDA version
+#   (Paddle provides version-specific wheels; do not mix CPU+GPU wheels).
+
+# Core
+# OpenCV 4.12+ requires NumPy 2.x on Windows; pin OpenCV < 4.12 to stay on NumPy 1.26.x.
+numpy==1.26.4
+opencv-python<4.12
+pyautogui
+pillow
+
+# OCR
+# PaddleOCR 3.x pulls in PaddleX/ModelScope/PyTorch; on Windows this often fails due to PyTorch DLL deps.
+# Keep PaddleOCR on 2.x for this project.
+paddleocr<3
+
+# Image diff / experiments
+matplotlib
+# PaddleOCR currently pulls in newer SciPy/skimage versions that expect NumPy 2.x ABI.
+# Pin to NumPy 1.x compatible wheels for Python 3.10 on Windows.
+scipy<1.12
+scikit-image<0.23
+imgaug
+lmdb
+pyclipper
+# Shapely 2.x wheels are often built against NumPy 2.x ABI; this project pins NumPy<2, so keep Shapely <2.
+shapely<2
+PyWavelets
+
+# Windows helpers (often needed by pyautogui on Windows)
+pywin32; platform_system == "Windows"
+
+# Build / packaging (only needed if you use setup.py / PyInstaller)
+setuptools
+Cython
+pyinstaller

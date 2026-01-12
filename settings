@@ -1,0 +1,7 @@
+{	"GPU": true,
+	"width_x": 2,
+	"height_y": 4,
+	"binary_threshold": 10,
+	"drawcontour": true,
+	"if_align":false
+}
