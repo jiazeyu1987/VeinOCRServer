@@ -4,6 +4,7 @@ import pyautogui
 
 import cv2
 import time, os
+import re
 
 
 
@@ -129,6 +130,11 @@ class OCRDetect:
 
 
         A_img = img[A_row_start:A_row_end, A_col_start:]
+        try:
+            A_img = cv2.resize(A_img, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+            A_img = cv2.convertScaleAbs(A_img, alpha=1.3, beta=0)
+        except Exception:
+            pass
 
         # self.showimg(A_img)
 
@@ -143,46 +149,157 @@ class OCRDetect:
         if batch is None:
             return None
 
-        # 识别到了
-        for i in range(len(batch)):  # 每张图片中识别的所有list
-            positions = batch[i][0]
-            text = batch[i][1][0]
-            text = text.replace('：', ':') # 把中文的冒号，改成英文的冒号
-            # print(text)
-            if 'A:' in text and 'mm' in text:
-                start_index = text.index("A:") + 2
-                end_index = text.index("mm")
-                self.MEASSURE["A"] = float(text[start_index:end_index])
-            else:
-                self.MEASSURE["A"] = None
+        tokens = []
+        for item in batch:
+            if item is None:
+                continue
+            try:
+                box = item[0]
+                t = item[1][0]
+            except Exception:
+                continue
+            if t is None:
+                continue
+            t = str(t).strip()
+            if not t:
+                continue
+            try:
+                xs = [p[0] for p in box]
+                ys = [p[1] for p in box]
+                x0 = min(xs)
+                y0 = min(ys)
+            except Exception:
+                x0, y0 = 0, 0
+            tokens.append((y0, x0, t))
 
-            if 'B:' in text and 'mm' in text:
-                start_index = text.index("B:") + 2
-                end_index = text.rindex("mm")
-                self.MEASSURE["B"] = float(text[start_index:end_index])
-            else:
-                self.MEASSURE["B"] = None
-
-            if '距离' in text and 'mm' in text:
-                start_index = text.index(":") + 1
-                end_index = text.index("mm")
-                # print(text[start_index:end_index])
-                self.MEASSURE['skin_distance'] = float(text[start_index:end_index])
-
-            # alpha;
-            if ":" in text:
-                start_index = text.rindex(":") + 1
-                if start_index > 15: # 是皮肤的距离:已经识别到;
-                    alpha_text = text[start_index:]
-                    alpha_text = alpha_text.replace('°', '')
-                    # print(alpha_text)
-                    if alpha_text != "":
-                        self.MEASSURE["Alpha"] = float(alpha_text)
-                    else:
-                        self.MEASSURE["Alpha"] = None
+        tokens.sort(key=lambda it: (it[0], it[1]))
+        text_line = "".join([t for _, _, t in tokens])
+        parsed = self._parse_distance_overlay(text_line)
+        if "A" in parsed and parsed["A"] is not None:
+            self.MEASSURE["A"] = parsed["A"]
+        if "B" in parsed and parsed["B"] is not None:
+            self.MEASSURE["B"] = parsed["B"]
+        if "skin_distance" in parsed and parsed["skin_distance"] is not None:
+            self.MEASSURE["skin_distance"] = parsed["skin_distance"]
+        if "Alpha" in parsed and parsed["Alpha"] is not None:
+            self.MEASSURE["Alpha"] = parsed["Alpha"]
 
 
         # results_show(A_img, results)
+
+    def _parse_mm_value(self, s: str):
+        if s is None:
+            return None
+        raw = str(s).strip()
+        if not raw:
+            return None
+
+        raw = (
+            raw.replace("O", "0")
+            .replace("o", "0")
+            .replace(",", ".")
+            .replace("I", "1")
+            .replace("l", "1")
+            .replace("|", "1")
+            .replace("!", "1")
+        )
+        raw = raw.replace(" ", "")
+        allowed = "0123456789.-"
+        filtered = "".join(ch for ch in raw if ch in allowed)
+        if not filtered:
+            return None
+
+        try:
+            if "." not in filtered and filtered.lstrip("-").isdigit():
+                digits = filtered.lstrip("-")
+                sign = "-" if filtered.startswith("-") else ""
+                if len(digits) >= 3:
+                    filtered = f"{sign}{digits[:-2]}.{digits[-2:]}"
+            return float(filtered)
+        except Exception:
+            return None
+
+    def _parse_number_value(self, s: str):
+        if s is None:
+            return None
+        raw = str(s).strip()
+        if not raw:
+            return None
+        raw = (
+            raw.replace("O", "0")
+            .replace("o", "0")
+            .replace(",", ".")
+            .replace("I", "1")
+            .replace("l", "1")
+            .replace("|", "1")
+            .replace("!", "1")
+            .replace(" ", "")
+        )
+        allowed = "0123456789.-"
+        filtered = "".join(ch for ch in raw if ch in allowed)
+        if not filtered:
+            return None
+        try:
+            return float(filtered)
+        except Exception:
+            return None
+
+    def _parse_distance_overlay(self, text: str):
+        out = {}
+        if text is None:
+            return out
+
+        s = str(text)
+        s = s.replace("：", ":").replace(" ", "")
+        # Join split digit tokens like "0.0" + "2mm" -> "0.02mm"
+        s = re.sub(r"(?<=\\d)[,，](?=\\d)", "", s)
+        s = re.sub(r"(?<=\\d)\\.(?:,|，)(?=\\d)", ".", s)
+        # Normalize a few common OCR confusions
+        s = s.replace("O", "0").replace("o", "0")
+
+        m = re.search(r"距离:([0-9Oo.,-]+)", s)
+        if m:
+            out["skin_distance"] = self._parse_mm_value(m.group(1))
+
+        m = re.search(r"A:([0-9Oo.,-]+)", s)
+        if m:
+            out["A"] = self._parse_mm_value(m.group(1))
+
+        m = re.search(r"B:([0-9Oo.,-]+)", s)
+        if m:
+            out["B"] = self._parse_mm_value(m.group(1))
+
+        # alpha may be α or a
+        m = re.search(r"(?:α|a|c|o):([0-9Oo.,-]+)", s)
+        if m:
+            out["Alpha"] = self._parse_number_value(m.group(1))
+        elif "Alpha" not in out:
+            m = re.search(r"([0-9Oo.,-]+)°", s)
+            if m:
+                out["Alpha"] = self._parse_number_value(m.group(1))
+
+        if ("A" not in out) or ("B" not in out):
+            mm_candidates = re.findall(r"([0-9Oo.,-]+)mm", s)
+            mm_values = []
+            for cand in mm_candidates:
+                v = self._parse_mm_value(cand)
+                if v is not None:
+                    mm_values.append(v)
+
+            # If distance was parsed, try to drop the closest match from candidates.
+            dist = out.get("skin_distance")
+            if dist is not None and mm_values:
+                closest_idx = min(range(len(mm_values)), key=lambda i: abs(mm_values[i] - dist))
+                mm_values = [v for i, v in enumerate(mm_values) if i != closest_idx]
+
+            # Use remaining values as A/B fallback (prefer last two in case distance is still present).
+            if len(mm_values) >= 2:
+                if "A" not in out:
+                    out["A"] = mm_values[-2]
+                if "B" not in out:
+                    out["B"] = mm_values[-1]
+
+        return out
 
 
     def find_Zoom_Scaler_in_ocr_results(self, results):

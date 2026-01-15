@@ -155,14 +155,14 @@ class ImageProcessServer:
         """截图识别"""
 
         results = {
-            'SkinDepth': self.ocrserver.MEASSURE['skin_distance'],
-            'A': self.ocrserver.MEASSURE['A'],
-            'B': self.ocrserver.MEASSURE['B'],
-            'Alpha': self.ocrserver.MEASSURE['Alpha'],
+            'SkinDepth': self.ocrserver.MEASSURE['skin_distance'] if self.ocrserver.MEASSURE['skin_distance'] is not None else 0,
+            'A': self.ocrserver.MEASSURE['A'] if self.ocrserver.MEASSURE['A'] is not None else 0,
+            'B': self.ocrserver.MEASSURE['B'] if self.ocrserver.MEASSURE['B'] is not None else 0,
+            'Alpha': self.ocrserver.MEASSURE['Alpha'] if self.ocrserver.MEASSURE['Alpha'] is not None else 0,
 
-            'Depth': self.ocrserver.MEASSURE['深度'],
-            'IsFreeze': self.ocrserver.MEASSURE['Is_Freeze'],
-            'Points_Per_MM': self.ocrserver.MEASSURE['Points_Per_MM'],
+            'Depth': self.ocrserver.MEASSURE['深度'] if self.ocrserver.MEASSURE['深度'] is not None else 0,
+            'IsFreeze': self.ocrserver.MEASSURE['Is_Freeze'] if self.ocrserver.MEASSURE['Is_Freeze'] is not None else False,
+            'Points_Per_MM': self.ocrserver.MEASSURE['Points_Per_MM'] if self.ocrserver.MEASSURE['Points_Per_MM'] is not None else 0,
         }
 
         # # 用于不截图的测试
