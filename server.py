@@ -13,7 +13,22 @@ import time
 from ocr_detect import OCRDetect
 import logging
 from datetime import datetime
-from treat_compare_img import ComparePoints
+def _load_compare_points_class():
+    """
+    Force-load `treat_compare_img.py` (source) even if a compiled extension
+    `treat_compare_img*.pyd` exists in the same directory.
+    """
+    import importlib.util
+    import os as _os
+
+    path = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "treat_compare_img.py")
+    spec = importlib.util.spec_from_file_location("treat_compare_img_py", path)
+    mod = importlib.util.module_from_spec(spec)  # type: ignore
+    assert spec and spec.loader
+    spec.loader.exec_module(mod)  # type: ignore
+    return mod.ComparePoints
+
+ComparePoints = _load_compare_points_class()
 
 class ImageProcessServer:
     def __init__(self):
@@ -62,6 +77,7 @@ class ImageProcessServer:
         self.client_thread = None
         self.compare_client = None
         self.stop_event = threading.Event()
+        self.compare_monitor_stop_event = threading.Event()
 
         self.compareTool = ComparePoints(self.setting, self.logger)
         # 为了首次调用服务器时不延迟，此处默认调用一次
@@ -69,6 +85,15 @@ class ImageProcessServer:
         # self.get_offline(json.dumps(default_offline))
         # time.sleep(1)
         # self.get_offline(json.dumps(default_offline))
+
+        # Always-on peak monitoring (frame capture + peak detection).
+        # OFFLINE requests only trigger saving the latest cached frames.
+        self.compare_monitor = threading.Thread(
+            target=self.compareTool.monitor_peaks,
+            args=(self.compare_monitor_stop_event,),
+            daemon=True,
+        )
+        self.compare_monitor.start()
 
 
     def init_logger(self, dst='ocrlog'):
@@ -174,41 +199,10 @@ class ImageProcessServer:
         #     self.compareTool = ComparePoints(self.logger)
         #     self.logger.info("成功导入对比截图工具")
 
-        if self.point_id != point_id:
-
-            self.point_id = point_id
-
-            # 1检查线程状态，确保上次运行已停止
-            if self.compare_client is not None and self.compare_client.is_alive():
-                self.stop_event.set()
-                self.compare_client.join(timeout=2)
-                del self.compare_client
-
-            # self.stop_event = multiprocessing.Event()
-
-            # 2重置停止信号（关键：必须清除之前的set状态）
-            self.stop_event.clear()
-
-            # 3创建并启动新线程
-            # self.compare_client = multiprocessing.Process(
-            self.compare_client = threading.Thread(
-                target=self.compareTool.detect,
-                args=(point_id, float(time_out), is_save, self.stop_event),
-            )
-
-            self.compare_client.start()
-
-        else:
-            self.point_id = None
-            self.stop_event.set()
-            self.logger.info("stop set成功。")
-            self.compare_client.join(timeout=3)
-
-
-
-        # self.compareTool.detect_compare_points(point_id, time_out, is_save)
-
-        results = self.compareTool.response
+        # OFFLINE is now a "save signal" only: persist latest cached peak frames.
+        # Peak monitoring is started when the server starts.
+        self.point_id = point_id
+        results = self.compareTool.save_latest(point_id=point_id, is_save=is_save)
 
         return results
 

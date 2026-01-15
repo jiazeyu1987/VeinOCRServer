@@ -10,7 +10,19 @@ os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 os.environ.setdefault("FLAGS_use_cuda", "0")
 
-import server
+import importlib.util
+import os as _os
+
+# IMPORTANT:
+# This repo ships optional Cython extensions (e.g. `server.cp310-...pyd`).
+# Python will prefer `.pyd` over `.py` for `import server`, which would bypass
+# local edits in `server.py`. Load `server.py` explicitly to ensure the Python
+# implementation is used.
+_server_path = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "server.py")
+_spec = importlib.util.spec_from_file_location("server_py", _server_path)
+server = importlib.util.module_from_spec(_spec)  # type: ignore
+assert _spec and _spec.loader
+_spec.loader.exec_module(server)  # type: ignore
 
 # server
 import socket

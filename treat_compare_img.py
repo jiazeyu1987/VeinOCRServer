@@ -10,6 +10,10 @@ from datetime import datetime
 import os
 import image_difference
 import threading
+from collections import deque
+from io import BytesIO
+
+from simplefem_peak_detection import detect_peaks
 
 class ComparePoints:
     def __init__(self, setting={}, logger=None):
@@ -24,6 +28,14 @@ class ComparePoints:
                         "drawcontour": setting['drawcontour'] if "drawcontour" in setting else False,
                         "if_align": setting['if_align'] if "if_align" in setting else False}
 
+        peak_cfg = setting.get("peak_detection", {}) if isinstance(setting, dict) else {}
+        self.peak_threshold = float(peak_cfg.get("threshold", 40.0))
+        self.peak_margin_frames = int(peak_cfg.get("margin_frames", 2))
+        self.peak_silence_frames = int(peak_cfg.get("silence_frames", 0))
+        self.peak_pre_post_avg_frames = int(peak_cfg.get("pre_post_avg_frames", 2))
+        self.peak_difference_threshold = float(peak_cfg.get("difference_threshold", 1.8))
+        self.peak_buffer_maxlen = int(peak_cfg.get("buffer_maxlen", 600))
+
         self.point_id = None
         self.save_point_id = None
 
@@ -35,6 +47,135 @@ class ComparePoints:
 
         self.active_task =  None
 
+        self._latest_lock = threading.Lock()
+        self._latest_peak_before = None  # (ts, png_bytes)
+        self._latest_peak_after = None   # (ts, png_bytes)
+        self._latest_any_before = None   # (ts, png_bytes) fallback
+        self._latest_any_after = None    # (ts, png_bytes) fallback
+        self._latest_peak_end_global = None
+
+        self.capture_fps = float(peak_cfg.get("capture_fps", 20.0))
+        if self.capture_fps <= 0:
+            self.capture_fps = 20.0
+
+        debug_cfg = peak_cfg.get("debug", {}) if isinstance(peak_cfg, dict) else {}
+        self.debug_enabled = bool(debug_cfg.get("enabled", False))
+        self.debug_save_roi1_frames = bool(debug_cfg.get("save_roi1_frames", False))
+        self.debug_save_every_n = int(debug_cfg.get("save_every_n", 1))
+        if self.debug_save_every_n <= 0:
+            self.debug_save_every_n = 1
+        self.debug_max_saved_frames = int(debug_cfg.get("max_saved_frames", 0))  # 0 = unlimited
+        self.debug_gray_log_enabled = bool(debug_cfg.get("gray_log_enabled", False))
+        self.debug_roi1_dir = str(debug_cfg.get("roi1_dir", "D:/software_data/roi1_debug"))
+        self.debug_gray_log_path = str(debug_cfg.get("gray_log_path", "ocrlog/roi1_gray_trace.csv"))
+        self.debug_peak_log_enabled = bool(debug_cfg.get("peak_log_enabled", False))
+        self.debug_peak_log_path = str(debug_cfg.get("peak_log_path", "ocrlog/peak_before_after_trace.csv"))
+
+        self._debug_saved_paths = deque(maxlen=self.debug_max_saved_frames if self.debug_max_saved_frames > 0 else None)
+        self._debug_frame_counter = 0
+        self._logged_peak_ids = set()
+        self._logged_peak_ids_lock = threading.Lock()
+
+
+    def _decode_png_to_rgb(self, png_bytes):
+        buf = np.frombuffer(png_bytes, dtype=np.uint8)
+        bgr = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+        if bgr is None:
+            raise ValueError("Failed to decode PNG bytes")
+        return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+    def _debug_save_frame(self, *, ts: datetime, global_idx: int, png_bytes: bytes):
+        if not (self.debug_enabled and self.debug_save_roi1_frames):
+            return
+        if (global_idx % self.debug_save_every_n) != 0:
+            return
+
+        try:
+            os.makedirs(self.debug_roi1_dir, exist_ok=True)
+            name = self.convert_timestamp2str(ts)
+            out_path = os.path.join(self.debug_roi1_dir, f"roi1_{global_idx:08d}_{name}.png")
+            with open(out_path, "wb") as f:
+                f.write(png_bytes)
+
+            if self.debug_max_saved_frames > 0:
+                if len(self._debug_saved_paths) == self._debug_saved_paths.maxlen:
+                    old = self._debug_saved_paths[0]
+                    if old != out_path and os.path.exists(old):
+                        try:
+                            os.remove(old)
+                        except Exception:
+                            pass
+                self._debug_saved_paths.append(out_path)
+        except Exception as e:
+            if self.logger:
+                self.logger.error(f"debug save roi1 frame failed: {e}")
+
+    def _debug_log_gray(self, *, ts: datetime, global_idx: int, gray_value: float):
+        if not (self.debug_enabled and self.debug_gray_log_enabled):
+            return
+        try:
+            # Ensure directory exists (if path contains folders)
+            log_dir = os.path.dirname(self.debug_gray_log_path)
+            if log_dir:
+                os.makedirs(log_dir, exist_ok=True)
+            # Append CSV line; write header if file doesn't exist
+            need_header = not os.path.exists(self.debug_gray_log_path)
+            with open(self.debug_gray_log_path, "a", encoding="utf-8") as f:
+                if need_header:
+                    f.write("timestamp,global_idx,gray_value,threshold,margin_frames,silence_frames,pre_post_avg_frames,diff_threshold\n")
+                f.write(
+                    f"{self.convert_timestamp2str(ts)},{global_idx},{gray_value:.6f},"
+                    f"{self.peak_threshold},{self.peak_margin_frames},{self.peak_silence_frames},"
+                    f"{self.peak_pre_post_avg_frames},{self.peak_difference_threshold}\n"
+                )
+        except Exception as e:
+            if self.logger:
+                self.logger.error(f"debug gray log write failed: {e}")
+
+    def _debug_log_peak(
+        self,
+        *,
+        start_global: int,
+        end_global: int,
+        before_global: int,
+        after_global: int,
+        before_ts: datetime,
+        after_ts: datetime,
+        before_gray: float,
+        after_gray: float,
+    ):
+        if not (self.debug_enabled and self.debug_peak_log_enabled):
+            return
+
+        peak_id = (start_global, end_global)
+        with self._logged_peak_ids_lock:
+            if peak_id in self._logged_peak_ids:
+                return
+            self._logged_peak_ids.add(peak_id)
+
+        try:
+            log_dir = os.path.dirname(self.debug_peak_log_path)
+            if log_dir:
+                os.makedirs(log_dir, exist_ok=True)
+
+            need_header = not os.path.exists(self.debug_peak_log_path)
+            with open(self.debug_peak_log_path, "a", encoding="utf-8") as f:
+                if need_header:
+                    f.write(
+                        "start_global,end_global,before_global,after_global,"
+                        "before_ts,after_ts,before_gray,after_gray,"
+                        "threshold,margin_frames,silence_frames,pre_post_avg_frames,diff_threshold\n"
+                    )
+                f.write(
+                    f"{start_global},{end_global},{before_global},{after_global},"
+                    f"{self.convert_timestamp2str(before_ts)},{self.convert_timestamp2str(after_ts)},"
+                    f"{before_gray:.6f},{after_gray:.6f},"
+                    f"{self.peak_threshold},{self.peak_margin_frames},{self.peak_silence_frames},"
+                    f"{self.peak_pre_post_avg_frames},{self.peak_difference_threshold}\n"
+                )
+        except Exception as e:
+            if self.logger:
+                self.logger.error(f"debug peak log write failed: {e}")
 
     def compute_grayscale_v1(self, screen_img): # 传原始的整个屏幕的截图过来，如果指定了某个区域，那么会造成copy的赋值操作
         ultra_col_start = 1269 # 最新版本的超声投屏图像的相对位置
@@ -416,6 +557,256 @@ class ComparePoints:
             self.response = {'success': False, 'info': 'error_in_write img', 'detail': e}
             return
 
+
+    def detect(self, point_id=None, duration=3, is_save=None, stop_event=None):
+        """
+        Peak-driven version (SimpleFEM logic):
+        - Detect peaks on grayscale curve using `simplefem_peak_detection.detect_peaks`
+        - Choose the last peak
+        - Use (start-1) frame as before, (end+1) frame as after
+        - Reuse existing `write_img()` for file + DB save (including `_diff.png`)
+        """
+        self.logger.info("detect(peak): " + str(point_id) + str(self.point_id) + " " + str(duration), )
+
+        self.point_id = point_id
+        self.save_point_id = point_id
+        self.is_save = is_save
+        self._stop_event = stop_event
+
+        frame_buffer = deque(maxlen=max(10, self.peak_buffer_maxlen))
+        global_idx = 0
+
+        first_frame = None  # (ts, png_bytes)
+        last_frame = None   # (ts, png_bytes)
+
+        last_peak_end_global = None
+        peak_before = None  # (ts, png_bytes)
+        peak_after = None   # (ts, png_bytes)
+
+        try:
+            while not self._stop_event.is_set():
+                img_pil, img_time = self.get_screen_shot()
+
+                bio = BytesIO()
+                img_pil.save(bio, format="PNG")
+                png_bytes = bio.getvalue()
+
+                if first_frame is None:
+                    first_frame = (img_time, png_bytes)
+
+                img_rgb = np.array(img_pil)
+                gray_value = float(self.compute_grayscale_v2(img_rgb))
+
+                frame_buffer.append((global_idx, img_time, png_bytes, gray_value))
+                last_frame = (img_time, png_bytes)
+                global_idx += 1
+
+                if len(frame_buffer) < 5:
+                    continue
+
+                curve = [v[3] for v in frame_buffer]
+                green_peaks, red_peaks = detect_peaks(
+                    curve,
+                    threshold=self.peak_threshold,
+                    marginFrames=self.peak_margin_frames,
+                    differenceThreshold=self.peak_difference_threshold,
+                    silenceFrames=self.peak_silence_frames,
+                    avgFrames=self.peak_pre_post_avg_frames,
+                    use_improved=False,
+                )
+
+                all_peaks = green_peaks + red_peaks
+                if not all_peaks:
+                    continue
+
+                all_peaks.sort(key=lambda p: (p[1], p[0]))
+                start, end = all_peaks[-1]
+
+                if start - 1 < 0 or end + 1 >= len(frame_buffer):
+                    continue
+
+                base_global = frame_buffer[0][0]
+                end_global = base_global + end
+
+                if last_peak_end_global is None or end_global > last_peak_end_global:
+                    last_peak_end_global = end_global
+                    before_entry = frame_buffer[start - 1]
+                    after_entry = frame_buffer[end + 1]
+                    peak_before = (before_entry[1], before_entry[2])
+                    peak_after = (after_entry[1], after_entry[2])
+
+        except Exception as e:
+            self.logger.error(f"detect(peak) error: {e}")
+            self.response = {'success': False, 'info': 'error_in_detect', 'detail': str(e)}
+            return
+
+        if peak_before is not None and peak_after is not None:
+            before_ts, before_png = peak_before
+            after_ts, after_png = peak_after
+        else:
+            if first_frame is None or last_frame is None:
+                self.logger.warning("no frames captured; skip write")
+                return
+            before_ts, before_png = first_frame
+            after_ts, after_png = last_frame
+
+        try:
+            self.compare_before = self._decode_png_to_rgb(before_png)
+            self.compare_after = self._decode_png_to_rgb(after_png)
+            self.before_name = self.convert_timestamp2str(before_ts)
+            self.after_name = self.convert_timestamp2str(after_ts)
+        except Exception as e:
+            self.logger.error(f"decode selected frames failed: {e}")
+            self.response = {'success': False, 'info': 'error_in_decode', 'detail': str(e)}
+            return
+
+        try:
+            self.write_img()
+        except Exception as e:
+            self.logger.error(e)
+            self.response = {'success': False, 'info': 'error_in_write_img', 'detail': str(e)}
+            return
+
+    def monitor_peaks(self, stop_event=None):
+        """
+        Always-on peak monitoring loop.
+
+        Continuously captures frames and runs peak detection on the rolling
+        grayscale curve. The latest detected peak (last by end index) is cached.
+        OFFLINE calls should use `save_latest()` to persist cached frames.
+        """
+        if stop_event is None:
+            stop_event = threading.Event()
+
+        frame_buffer = deque(maxlen=max(10, self.peak_buffer_maxlen))
+        global_idx = 0
+        sleep_s = 1.0 / self.capture_fps if self.capture_fps > 0 else 0.05
+        logged_start = False
+
+        while not stop_event.is_set():
+            try:
+                if not logged_start and self.logger:
+                    self.logger.info(
+                        f"monitor_peaks started: fps={self.capture_fps}, buf={self.peak_buffer_maxlen}, "
+                        f"threshold={self.peak_threshold}, margin={self.peak_margin_frames}, silence={self.peak_silence_frames}, "
+                        f"avg={self.peak_pre_post_avg_frames}, diff={self.peak_difference_threshold}, "
+                        f"debug_enabled={self.debug_enabled}, save_roi1_frames={self.debug_save_roi1_frames}, roi1_dir={self.debug_roi1_dir}, "
+                        f"gray_log_enabled={self.debug_gray_log_enabled}, gray_log_path={self.debug_gray_log_path}"
+                    )
+                    logged_start = True
+
+                img_pil, img_time = self.get_screen_shot()
+
+                bio = BytesIO()
+                img_pil.save(bio, format="PNG")
+                png_bytes = bio.getvalue()
+
+                img_rgb = np.array(img_pil)
+                gray_value = float(self.compute_grayscale_v2(img_rgb))
+
+                frame_buffer.append((global_idx, img_time, png_bytes, gray_value))
+                self._debug_save_frame(ts=img_time, global_idx=global_idx, png_bytes=png_bytes)
+                self._debug_log_gray(ts=img_time, global_idx=global_idx, gray_value=gray_value)
+                global_idx += 1
+
+                with self._latest_lock:
+                    if self._latest_any_before is None:
+                        self._latest_any_before = (img_time, png_bytes)
+                    self._latest_any_after = (img_time, png_bytes)
+
+                if len(frame_buffer) >= 5:
+                    curve = [v[3] for v in frame_buffer]
+                    green_peaks, red_peaks = detect_peaks(
+                        curve,
+                        threshold=self.peak_threshold,
+                        marginFrames=self.peak_margin_frames,
+                        differenceThreshold=self.peak_difference_threshold,
+                        silenceFrames=self.peak_silence_frames,
+                        avgFrames=self.peak_pre_post_avg_frames,
+                        use_improved=False,
+                    )
+                    all_peaks = green_peaks + red_peaks
+                    if all_peaks:
+                        all_peaks.sort(key=lambda p: (p[1], p[0]))
+                        start, end = all_peaks[-1]
+                        if start - 1 >= 0 and end + 1 < len(frame_buffer):
+                            base_global = frame_buffer[0][0]
+                            end_global = base_global + end
+                            # Only update cache once per new peak (global end index increases).
+                            should_log = False
+                            before_entry = None
+                            after_entry = None
+                            with self._latest_lock:
+                                if self._latest_peak_end_global is None or end_global > self._latest_peak_end_global:
+                                    self._latest_peak_end_global = end_global
+                                    before_entry = frame_buffer[start - 1]
+                                    after_entry = frame_buffer[end + 1]
+                                    self._latest_peak_before = (before_entry[1], before_entry[2])
+                                    self._latest_peak_after = (after_entry[1], after_entry[2])
+                                    should_log = True
+
+                            if should_log and before_entry is not None and after_entry is not None:
+                                start_global = base_global + start
+                                before_global = base_global + (start - 1)
+                                after_global = base_global + (end + 1)
+                                self._debug_log_peak(
+                                    start_global=start_global,
+                                    end_global=end_global,
+                                    before_global=before_global,
+                                    after_global=after_global,
+                                    before_ts=before_entry[1],
+                                    after_ts=after_entry[1],
+                                    before_gray=float(before_entry[3]),
+                                    after_gray=float(after_entry[3]),
+                                )
+
+            except Exception as e:
+                if self.logger:
+                    self.logger.error(f"monitor_peaks error: {e}")
+            finally:
+                if sleep_s > 0:
+                    time.sleep(sleep_s)
+
+    def save_latest(self, *, point_id: int, is_save: bool):
+        """
+        Persist the latest cached peak frames (or fallback frames) using existing
+        `write_img()` + DB update logic.
+        """
+        self.save_point_id = point_id
+        self.is_save = is_save
+
+        with self._latest_lock:
+            peak_before = self._latest_peak_before
+            peak_after = self._latest_peak_after
+            fallback_before = self._latest_any_before
+            fallback_after = self._latest_any_after
+
+        if peak_before is not None and peak_after is not None:
+            before_ts, before_png = peak_before
+            after_ts, after_png = peak_after
+            used = "peak"
+        else:
+            if fallback_before is None or fallback_after is None:
+                self.response = {'success': False, 'info': 'no_frames_captured'}
+                return self.response
+            before_ts, before_png = fallback_before
+            after_ts, after_png = fallback_after
+            used = "fallback"
+
+        try:
+            self.compare_before = self._decode_png_to_rgb(before_png)
+            self.compare_after = self._decode_png_to_rgb(after_png)
+            self.before_name = self.convert_timestamp2str(before_ts)
+            self.after_name = self.convert_timestamp2str(after_ts)
+
+            self.write_img()
+            self.response = {'success': True, 'info': f'saved_{used}', 'point_id': point_id}
+            return self.response
+        except Exception as e:
+            if self.logger:
+                self.logger.error(e)
+            self.response = {'success': False, 'info': 'save_failed', 'detail': str(e)}
+            return self.response
 
 
 if __name__ == '__main__':

@@ -3,5 +3,28 @@
 	"height_y": 4,
 	"binary_threshold": 10,
 	"drawcontour": true,
-	"if_align":false
+	"if_align":false,
+	"peak_detection": {
+		"threshold": 40.0,
+		"threshold_minimum": 40.0,
+		"threshold_over_mean_ratio": 0.08,
+		"margin_frames": 2,
+		"silence_frames": 0,
+		"pre_post_avg_frames": 2,
+		"difference_threshold": 1.8,
+		"use_improved_algorithm": false,
+		"buffer_maxlen": 600,
+		"capture_fps": 20.0,
+		"debug": {
+			"enabled": false,
+			"save_roi1_frames": false,
+			"save_every_n": 1,
+			"max_saved_frames": 0,
+			"roi1_dir": "D:/software_data/roi1_debug",
+			"gray_log_enabled": false,
+			"gray_log_path": "ocrlog/roi1_gray_trace.csv",
+			"peak_log_enabled": false,
+			"peak_log_path": "ocrlog/peak_before_after_trace.csv"
+		}
+	}
 }
