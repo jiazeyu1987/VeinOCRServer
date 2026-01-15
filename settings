@@ -1,4 +1,24 @@
 {	"GPU": true,
+	"ocr": {
+		"__comment_engine": "engine: tesseract|paddle. Default is tesseract. Set to paddle to use PaddleOCR.",
+		"__comment_tesseract_cmd": "tesseract_cmd: optional full path to tesseract.exe if not in PATH.",
+		"engine": "tesseract",
+		"fallback_to_paddle": true,
+		"tesseract": {
+			"tesseract_cmd": "",
+			"lang": "chi_sim+eng",
+			"oem": 3,
+			"psm": 6,
+			"line_psm": 7,
+			"config": "-c preserve_interword_spaces=1",
+			"whitelist": "0123456789.:,ABab距离α°mm",
+			"preprocess": {
+				"enabled": true,
+				"upscale": 2,
+				"threshold": "otsu"
+			}
+		}
+	},
 	"width_x": 2,
 	"height_y": 4,
 	"binary_threshold": 10,

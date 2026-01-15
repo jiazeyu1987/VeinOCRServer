@@ -10,9 +10,31 @@ import threading
 import json
 import time
 
-from ocr_detect import OCRDetect
 import logging
 from datetime import datetime
+
+def _import_ocr_detect_source():
+    """
+    Force-load `ocr_detect.py` (source) even if a compiled extension
+    `ocr_detect*.pyd` exists in the same directory.
+    """
+    import importlib.util
+    import os as _os
+    import sys as _sys
+
+    existing = _sys.modules.get("ocr_detect")
+    if existing is not None and str(getattr(existing, "__file__", "")).endswith("ocr_detect.py"):
+        return existing
+
+    path = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "ocr_detect.py")
+    spec = importlib.util.spec_from_file_location("ocr_detect", path)
+    mod = importlib.util.module_from_spec(spec)  # type: ignore
+    assert spec and spec.loader
+    spec.loader.exec_module(mod)  # type: ignore
+    _sys.modules["ocr_detect"] = mod
+    return mod
+
+OCRDetect = _import_ocr_detect_source().OCRDetect
 def _load_compare_points_class():
     """
     Force-load `treat_compare_img.py` (source) even if a compiled extension
@@ -127,11 +149,13 @@ class ImageProcessServer:
         setting_path = os.path.join(cur_dir, 'settings')
 
         if os.path.exists(setting_path):
-            with open(setting_path, 'r') as f:
+            for enc in ("utf-8", "utf-8-sig"):
                 try:
-                    return json.load(f)
-                except:
-                    return None
+                    with open(setting_path, 'r', encoding=enc) as f:
+                        return json.load(f)
+                except Exception:
+                    continue
+            return None
         else:
             return None
 

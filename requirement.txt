@@ -16,6 +16,7 @@ pillow
 # PaddleOCR 3.x pulls in PaddleX/ModelScope/PyTorch; on Windows this often fails due to PyTorch DLL deps.
 # Keep PaddleOCR on 2.x for this project.
 paddleocr<3
+pytesseract
 
 # Image diff / experiments
 matplotlib

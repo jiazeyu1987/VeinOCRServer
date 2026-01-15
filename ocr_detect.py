@@ -1,11 +1,36 @@
 import numpy as np
-from paddleocr import PaddleOCR, draw_ocr
 import pyautogui
 
 import cv2
 import time, os
 import re
+from typing import Dict, List, Optional
 
+
+def _load_paddleocr():
+    from paddleocr import PaddleOCR  # type: ignore
+
+    draw_ocr = None
+    try:
+        from paddleocr import draw_ocr as _draw_ocr  # type: ignore
+
+        draw_ocr = _draw_ocr
+    except Exception:
+        draw_ocr = None
+
+    return PaddleOCR, draw_ocr
+
+
+def _load_pytesseract():
+    import pytesseract  # type: ignore
+
+    return pytesseract
+
+
+def _pil_from_rgb(rgb: np.ndarray):
+    from PIL import Image  # type: ignore
+
+    return Image.fromarray(rgb)
 
 
 class OCRDetect:
@@ -21,28 +46,74 @@ class OCRDetect:
 
         cur_dir = os.path.dirname(os.path.abspath(__file__))
 
+        ocr_cfg = setting.get("ocr", {}) if isinstance(setting, dict) else {}
+        self.ocr_engine = str(ocr_cfg.get("engine", "tesseract")).lower().strip()
+        self.fallback_to_paddle = bool(ocr_cfg.get("fallback_to_paddle", True))
+        self.tesseract_cfg = ocr_cfg.get("tesseract", {}) if isinstance(ocr_cfg, dict) else {}
+
         use_gpu = setting['GPU'] if 'GPU' in setting else False
         if use_gpu is True:
             self.logger.info("Using GPU checking.")
             gpu_num = self.get_gpu_count()
             if gpu_num == 0:
                 use_gpu = False
+        self._use_gpu = use_gpu
 
-        # 首先要导入一个全局的模型，不然每次都导入，会花费额外的时间
-        self.OCR_MDOEL = PaddleOCR(use_angle_cls=True, lang="ch", use_gpu=use_gpu, rec_image_shape='3, 24, 160', rec_batch_num=8,
-                        precision='fp32', show_log=setting['log'] if 'log' in setting else False,
+        self.OCR_MDOEL = None
+        self._draw_ocr = None
+        self._pytesseract = None
 
-                       det_model_dir=setting['det'] if 'det' in setting else './whl/det/ch/ch_PP-OCRv4_det_infer',  # 检测模型路径; 如果用os.path.join(cur_dir, .,.. )的方式，在本机总是出错
-                       rec_model_dir=setting['rec'] if 'rec' in setting else './whl/rec/ch/ch_PP-OCRv4_rec_infer',  # 识别模型路径
-                       cls_model_dir=setting['cls'] if 'cls' in setting else './whl/cls/ch_ppocr_mobile_v2.0_cls_infer',  # 分类模型路径
-                                   )  # need to run only once to download and load model into memory
-        print(os.path.join(cur_dir, 'whl/cls/ch_ppocr_mobile_v2.0_cls_infer'))
+        self._paddle_kwargs = dict(
+            use_angle_cls=True,
+            lang="ch",
+            use_gpu=use_gpu,
+            rec_image_shape='3, 24, 160',
+            rec_batch_num=8,
+            precision='fp32',
+            det_model_dir=setting['det'] if 'det' in setting else './whl/det/ch/ch_PP-OCRv4_det_infer',
+            rec_model_dir=setting['rec'] if 'rec' in setting else './whl/rec/ch/ch_PP-OCRv4_rec_infer',
+            cls_model_dir=setting['cls'] if 'cls' in setting else './whl/cls/ch_ppocr_mobile_v2.0_cls_infer',
+        )
+        if 'log' in setting:
+            self._paddle_kwargs["show_log"] = setting['log']
+
+        if self.ocr_engine == "tesseract":
+            try:
+                self._pytesseract = _load_pytesseract()
+                tcmd = str(self.tesseract_cfg.get("tesseract_cmd", "")).strip()
+                if tcmd:
+                    self._pytesseract.pytesseract.tesseract_cmd = tcmd
+                self.logger.info("OCR engine: tesseract")
+            except Exception as e:
+                self.logger.error(f"tesseract init failed: {e}")
+                if not self.fallback_to_paddle:
+                    raise
+                self.ocr_engine = "paddle"
+
+        if self.ocr_engine == "paddle":
+            self._init_paddleocr()
+
+            print(os.path.join(cur_dir, 'whl/cls/ch_ppocr_mobile_v2.0_cls_infer'))
+            self.logger.info("OCR engine: paddle")
+
         self.time_skip = setting['time_skip'] if 'time_skip' in setting else 0
 
         # 测量，缩放，是否冻结等尺度相关
         self.MEASSURE = {'增益': None, '深度': None, '频率': None, '图像增强': None,
 
                     'skin_distance': None, 'A': None, 'B': None, 'Alpha': None, 'Zoom_scaler': 1.0, 'Is_Freeze': False}
+
+    def _init_paddleocr(self):
+        if self.OCR_MDOEL is not None:
+            return
+        PaddleOCR, draw_ocr = _load_paddleocr()
+        self._draw_ocr = draw_ocr
+        paddle_kwargs = dict(self._paddle_kwargs)
+        try:
+            self.OCR_MDOEL = PaddleOCR(**paddle_kwargs)
+        except Exception:
+            paddle_kwargs.pop("show_log", None)
+            self.OCR_MDOEL = PaddleOCR(**paddle_kwargs)
 
 
     def get_gpu_count(self):
@@ -79,9 +150,115 @@ class OCRDetect:
             boxes = [line[0] for line in result]
             txts = [line[1][0] for line in result]
             scores = [line[1][1] for line in result]
-        im_show = draw_ocr(img, boxes, txts, scores, font_path='./fonts/simfang.ttf')
+        if self._draw_ocr is None:
+            return
+        im_show = self._draw_ocr(img, boxes, txts, scores, font_path='./fonts/simfang.ttf')
         cv2.imshow('img1', im_show)
         cv2.waitKey(0)
+
+    def _preprocess_for_tesseract(self, rgb: np.ndarray):
+        cfg = self.tesseract_cfg.get("preprocess", {}) if isinstance(self.tesseract_cfg, dict) else {}
+        if not isinstance(cfg, dict) or not bool(cfg.get("enabled", False)):
+            return rgb
+
+        img = rgb
+        try:
+            upscale = int(cfg.get("upscale", 2))
+            if upscale > 1:
+                img = cv2.resize(img, (img.shape[1] * upscale, img.shape[0] * upscale), interpolation=cv2.INTER_CUBIC)
+
+            gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+            th_mode = str(cfg.get("threshold", "otsu")).lower().strip()
+            if th_mode == "otsu":
+                _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            elif th_mode == "binary":
+                _, bw = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY)
+            else:
+                bw = gray
+
+            bw = cv2.cvtColor(bw, cv2.COLOR_GRAY2RGB)
+            return bw
+        except Exception:
+            return rgb
+
+    def _tesseract_ocr(self, bgr: np.ndarray, *, psm: Optional[int] = None):
+        if self._pytesseract is None:
+            raise RuntimeError("pytesseract is not available")
+
+        if bgr is None:
+            return [[]]
+
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB) if len(bgr.shape) == 3 else bgr
+        rgb = self._preprocess_for_tesseract(rgb)
+        pil_img = _pil_from_rgb(rgb)
+
+        lang = str(self.tesseract_cfg.get("lang", "chi_sim")).strip() or "chi_sim"
+        oem = int(self.tesseract_cfg.get("oem", 3))
+        base_psm = int(self.tesseract_cfg.get("psm", 6))
+        use_psm = int(psm) if psm is not None else base_psm
+        extra = str(self.tesseract_cfg.get("config", "")).strip()
+        whitelist = str(self.tesseract_cfg.get("whitelist", "")).strip()
+
+        config_parts = [f"--oem {oem}", f"--psm {use_psm}"]
+        if whitelist:
+            config_parts.append(f"-c tessedit_char_whitelist={whitelist}")
+        if extra:
+            config_parts.append(extra)
+        config = " ".join(config_parts)
+
+        data: Dict[str, List[str]] = self._pytesseract.image_to_data(
+            pil_img,
+            lang=lang,
+            config=config,
+            output_type=self._pytesseract.Output.DICT,
+        )
+
+        n = len(data.get("text", []))
+        items = []
+        for i in range(n):
+            text = str(data["text"][i]).strip()
+            if not text:
+                continue
+            try:
+                conf = float(data["conf"][i])
+            except Exception:
+                conf = -1.0
+            score = 0.0 if conf < 0 else max(0.0, min(1.0, conf / 100.0))
+
+            try:
+                x = int(float(data["left"][i]))
+                y = int(float(data["top"][i]))
+                w = int(float(data["width"][i]))
+                h = int(float(data["height"][i]))
+            except Exception:
+                continue
+
+            box = [[x, y], [x + w, y], [x + w, y + h], [x, y + h]]
+            items.append([box, (text, score)])
+
+        return [items]
+
+    def _ocr(self, img_bgr: np.ndarray, *, line_mode: bool = False):
+        if img_bgr is None:
+            return [[]]
+
+        if self.ocr_engine == "tesseract":
+            psm = None
+            if line_mode:
+                psm = int(self.tesseract_cfg.get("line_psm", 7))
+            try:
+                return self._tesseract_ocr(img_bgr, psm=psm)
+            except Exception as e:
+                if not self.fallback_to_paddle:
+                    raise
+                self.logger.error(f"tesseract ocr failed, fallback to paddle: {e}")
+                self.ocr_engine = "paddle"
+                self._init_paddleocr()
+
+        if self.OCR_MDOEL is None:
+            raise RuntimeError("PaddleOCR model is not initialized")
+        return self.OCR_MDOEL.ocr(img_bgr)
+
     def find_is_freeze_in_ocr_results(self, results):
         ## 超声图像中的位置
         # 是否冻结：冻结的话，有一个雪花的标志，会被识别到一个 * 符号
@@ -138,7 +315,7 @@ class OCRDetect:
 
         # self.showimg(A_img)
 
-        results = self.OCR_MDOEL.ocr(A_img)
+        results = self._ocr(A_img, line_mode=True)
 
         # self.results_show(A_img, results)
 
@@ -405,7 +582,7 @@ class OCRDetect:
         # 实际使用的时候，需要放开以下两行
         if img is None:
             img = pyautogui.screenshot(allScreens=False, region=(0, 0, 1920, 1080))
-            img = np.array(img)
+            img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
 
         # showimg(img)
 
@@ -418,7 +595,7 @@ class OCRDetect:
         # 如果在段落测量，就更新AB和Alpha的值
         self.detect_distance_in_img(img)
 
-        results = self.OCR_MDOEL.ocr(img[822:944, 1304:])
+        results = self._ocr(img[822:944, 1304:])
 
         # self.results_show(img[822:944, 1304:], results)
 
