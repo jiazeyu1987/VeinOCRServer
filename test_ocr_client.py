@@ -118,6 +118,7 @@ def run_gui() -> int:
 
     log_q: "queue.Queue[LogEvent]" = queue.Queue()
     stop_watch = threading.Event()
+    stop_offline_watch = threading.Event()
 
     def log(level: str, message: str) -> None:
         log_q.put(LogEvent(ts=time.time(), level=level, message=message))
@@ -258,6 +259,45 @@ def run_gui() -> int:
 
         threading.Thread(target=loop, daemon=True).start()
 
+    def start_offline_watch(point_id: int, time_out: float, is_save: bool = True) -> None:
+        if stop_offline_watch.is_set() is False and getattr(start_offline_watch, "_running", False):
+            return
+        stop_offline_watch.clear()
+        setattr(start_offline_watch, "_running", True)
+        log("INFO", f"OFFLINE watch started (point_id={point_id}, time_out={time_out}, is_save={is_save})")
+
+        def loop() -> None:
+            while not stop_offline_watch.is_set():
+                try:
+                    host, port, password, timeout_s = parse_conn()
+                    offline_args = json.dumps(
+                        {"point_id": int(point_id), "time_out": float(time_out), "is_save": bool(is_save)},
+                        ensure_ascii=False,
+                    )
+                    obj, raw = send_once(host, port, "OFFLINE", password, offline_args, timeout_s)
+                    if raw == "":
+                        log("WARN", "OFFLINE watch: no response (expected).")
+                    elif obj is not None:
+                        log("OK", f"OFFLINE watch: {json.dumps(obj, ensure_ascii=False)}")
+                    else:
+                        log("OK", f"OFFLINE watch: {raw}")
+                except Exception as e:
+                    log("ERR", f"OFFLINE watch error: {e}")
+
+                try:
+                    interval_s = float(interval_var.get().strip())
+                except Exception:
+                    interval_s = 0.5
+                stop_offline_watch.wait(max(0.05, interval_s))
+
+            setattr(start_offline_watch, "_running", False)
+            log("INFO", "OFFLINE watch stopped")
+
+        threading.Thread(target=loop, daemon=True).start()
+
+    def stop_offline_watch_now() -> None:
+        stop_offline_watch.set()
+
     def stop_watch_now() -> None:
         if not watch_var.get():
             return
@@ -312,24 +352,11 @@ def run_gui() -> int:
             start_watch()
             log("INFO", "已启动 OCR 识别（ONLINE Watch）")
 
-        # 2. 发送 OFFLINE 请求启动图像对比
+        # 2. 启动 OFFLINE watch（图像对比/保存触发）
         try:
-            host, port, password, timeout_s = parse_conn()
             point_id = point_id_var.get().strip()
             time_out = time_out_var.get().strip()
-            offline_args = json.dumps({"point_id": int(point_id), "time_out": float(time_out), "is_save": True}, ensure_ascii=False)
-
-            def send_offline():
-                obj, raw = send_once(host, port, "OFFLINE", password, offline_args, timeout_s)
-                if raw == "":
-                    log("WARN", "OFFLINE 启动：无响应（正常）")
-                elif obj is not None:
-                    log("OK", f"OFFLINE 启动: {json.dumps(obj, ensure_ascii=False)}")
-                else:
-                    log("OK", f"OFFLINE 启动: {raw}")
-
-            threading.Thread(target=send_offline, daemon=True).start()
-            log("INFO", f"已启动图像对比（OFFLINE point_id={point_id}, time_out={time_out}）")
+            start_offline_watch(point_id=int(point_id), time_out=float(time_out), is_save=True)
         except Exception as e:
             log("ERR", f"启动图像对比失败: {e}")
 
@@ -340,26 +367,8 @@ def run_gui() -> int:
             stop_watch_now()
             log("INFO", "已停止 OCR 识别（ONLINE Watch）")
 
-        # 2. 发送相同的 OFFLINE 请求停止图像对比
-        try:
-            host, port, password, timeout_s = parse_conn()
-            point_id = point_id_var.get().strip()
-            time_out = time_out_var.get().strip()
-            offline_args = json.dumps({"point_id": int(point_id), "time_out": float(time_out), "is_save": True}, ensure_ascii=False)
-
-            def send_offline():
-                obj, raw = send_once(host, port, "OFFLINE", password, offline_args, timeout_s)
-                if raw == "":
-                    log("WARN", "OFFLINE 停止：无响应（正常）")
-                elif obj is not None:
-                    log("OK", f"OFFLINE 停止: {json.dumps(obj, ensure_ascii=False)}")
-                else:
-                    log("OK", f"OFFLINE 停止: {raw}")
-
-            threading.Thread(target=send_offline, daemon=True).start()
-            log("INFO", f"已停止图像对比（OFFLINE point_id={point_id}）")
-        except Exception as e:
-            log("ERR", f"停止图像对比失败: {e}")
+        # 2. 停止 OFFLINE watch（图像对比/保存触发）
+        stop_offline_watch_now()
 
     ttk.Button(btns, text="启动 OCR+图像对比", command=start_all).grid(row=0, column=10, padx=(0, 8))
     ttk.Button(btns, text="停止 OCR+图像对比", command=stop_all).grid(row=0, column=11)

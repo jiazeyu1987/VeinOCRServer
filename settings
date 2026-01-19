@@ -36,14 +36,14 @@
 		"buffer_maxlen": 600,
 		"capture_fps": 20.0,
 		"debug": {
-			"enabled": false,
-			"save_roi1_frames": false,
+			"enabled": true,
+			"save_roi1_frames": true,
 			"save_every_n": 1,
 			"max_saved_frames": 0,
 			"roi1_dir": "D:/software_data/roi1_debug",
-			"gray_log_enabled": false,
+			"gray_log_enabled": true,
 			"gray_log_path": "ocrlog/roi1_gray_trace.csv",
-			"peak_log_enabled": false,
+			"peak_log_enabled": true,
 			"peak_log_path": "ocrlog/peak_before_after_trace.csv"
 		}
 	}
