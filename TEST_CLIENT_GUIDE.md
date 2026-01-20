@@ -53,6 +53,10 @@ python test_ocr_client.py --cli
 
 ```
 1. 启动服务器：python main.py
+   - 默认是“监督进程”模式：主进程负责对外监听 `30415`，并启动/监控两个子进程：
+     - `worker_ocr.py`（OCR，默认端口 `30416`，仅本机使用）
+     - `worker_compare.py`（截图/波峰/对比，默认端口 `30417`，仅本机使用）
+   - 如需旧的单进程版本：`python server.py --legacy`
 2. 启动客户端：python test_ocr_client.py
 3. 设置 PointID（例如：456）
 4. 点击"启动 OCR+图像对比"

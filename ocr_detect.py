@@ -77,7 +77,10 @@ class OCRDetect:
         if 'log' in setting:
             self._paddle_kwargs["show_log"] = setting['log']
 
-        if self.ocr_engine == "tesseract":
+        if self.ocr_engine in ("none", "off", "disabled"):
+            self.logger.info("OCR engine: disabled")
+            self.ocr_engine = "none"
+        elif self.ocr_engine == "tesseract":
             try:
                 self._pytesseract = _load_pytesseract()
                 tcmd = str(self.tesseract_cfg.get("tesseract_cmd", "")).strip()
@@ -108,12 +111,52 @@ class OCRDetect:
             return
         PaddleOCR, draw_ocr = _load_paddleocr()
         self._draw_ocr = draw_ocr
-        paddle_kwargs = dict(self._paddle_kwargs)
+        # PaddleOCR 2.x uses `use_gpu=...`; PaddleOCR 3.x removed/renamed several args and
+        # validates "common args", raising `ValueError: Unknown argument: xxx`.
+        # Keep a single codepath by (1) setting Paddle device explicitly, (2) retrying with
+        # unsupported kwargs removed.
+        os.environ.setdefault("DISABLE_MODEL_SOURCE_CHECK", "True")
+
         try:
-            self.OCR_MDOEL = PaddleOCR(**paddle_kwargs)
+            import paddle  # type: ignore
+
+            if self._use_gpu and getattr(paddle, "is_compiled_with_cuda", lambda: False)():
+                paddle.set_device("gpu:0")
+            else:
+                os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+                paddle.set_device("cpu")
         except Exception:
-            paddle_kwargs.pop("show_log", None)
-            self.OCR_MDOEL = PaddleOCR(**paddle_kwargs)
+            pass
+
+        paddle_kwargs = dict(self._paddle_kwargs)
+        # Some envs/configs pass `show_log`; keep it best-effort.
+        max_attempts = 20
+        for _ in range(max_attempts):
+            try:
+                self.OCR_MDOEL = PaddleOCR(**paddle_kwargs)
+                return
+            except Exception as e:
+                msg = str(e)
+                # PaddleOCR 3.x: ValueError("Unknown argument: use_gpu")
+                m = re.search(r"Unknown argument:\s*([A-Za-z_][A-Za-z0-9_]*)", msg)
+                if m:
+                    bad = m.group(1)
+                    if bad in paddle_kwargs:
+                        paddle_kwargs.pop(bad, None)
+                        continue
+                # Python TypeError: got an unexpected keyword argument 'xxx'
+                m2 = re.search(r"unexpected keyword argument ['\"]([A-Za-z_][A-Za-z0-9_]*)['\"]", msg)
+                if m2:
+                    bad = m2.group(1)
+                    if bad in paddle_kwargs:
+                        paddle_kwargs.pop(bad, None)
+                        continue
+                # Last-resort: some builds don't support show_log.
+                if "show_log" in paddle_kwargs:
+                    paddle_kwargs.pop("show_log", None)
+                    continue
+                raise
+        raise RuntimeError(f"Failed to init PaddleOCR after {max_attempts} attempts; last kwargs={sorted(paddle_kwargs.keys())}")
 
 
     def get_gpu_count(self):

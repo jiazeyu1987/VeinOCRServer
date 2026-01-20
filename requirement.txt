@@ -11,6 +11,7 @@ numpy==1.26.4
 opencv-python<4.12
 pyautogui
 pillow
+mss
 
 # OCR
 # PaddleOCR 3.x pulls in PaddleX/ModelScope/PyTorch; on Windows this often fails due to PyTorch DLL deps.

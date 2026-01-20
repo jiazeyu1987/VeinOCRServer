@@ -12,6 +12,7 @@ import time
 
 import logging
 from datetime import datetime
+import sys
 
 def _import_ocr_detect_source():
     """
@@ -33,8 +34,7 @@ def _import_ocr_detect_source():
     spec.loader.exec_module(mod)  # type: ignore
     _sys.modules["ocr_detect"] = mod
     return mod
-
-OCRDetect = _import_ocr_detect_source().OCRDetect
+ 
 def _load_compare_points_class():
     """
     Force-load `treat_compare_img.py` (source) even if a compiled extension
@@ -50,7 +50,12 @@ def _load_compare_points_class():
     spec.loader.exec_module(mod)  # type: ignore
     return mod.ComparePoints
 
-ComparePoints = _load_compare_points_class()
+def _get_ocr_detect_class():
+    return _import_ocr_detect_source().OCRDetect
+
+
+def _get_compare_points_class():
+    return _load_compare_points_class()
 
 class ImageProcessServer:
     def __init__(self):
@@ -86,9 +91,14 @@ class ImageProcessServer:
 
         self.setting = self.load_setting()
 
+        OCRDetect = _get_ocr_detect_class()
         self.ocrserver = OCRDetect(self.setting, self.logger)
 
-        self.start_ocr_server()
+        # Allow disabling OCR entirely to benchmark peak capture FPS.
+        if isinstance(self.setting, dict) and str(self.setting.get("ocr", {}).get("engine", "")).lower() in ("none", "off", "disabled"):
+            self.logger.info("OCR disabled by settings; skip start_ocr_server()")
+        else:
+            self.start_ocr_server()
 
 
 
@@ -101,6 +111,7 @@ class ImageProcessServer:
         self.stop_event = threading.Event()
         self.compare_monitor_stop_event = threading.Event()
 
+        ComparePoints = _get_compare_points_class()
         self.compareTool = ComparePoints(self.setting, self.logger)
         # 为了首次调用服务器时不延迟，此处默认调用一次
         # default_offline = {"point_id": 3141592653, "is_save": False, "time_out": 100}
@@ -145,19 +156,43 @@ class ImageProcessServer:
 
 
     def load_setting(self):
-        cur_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)))
-        setting_path = os.path.join(cur_dir, 'settings')
+        candidates = []
+        try:
+            exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+            candidates.extend([exe_dir, os.path.dirname(exe_dir)])
+        except Exception:
+            pass
+        try:
+            here = os.path.dirname(os.path.abspath(__file__))
+            candidates.extend([here, os.path.dirname(here)])
+        except Exception:
+            pass
+        try:
+            candidates.append(os.path.abspath(os.getcwd()))
+        except Exception:
+            pass
 
-        if os.path.exists(setting_path):
+        seen = set()
+        uniq = []
+        for d in candidates:
+            if not d:
+                continue
+            d = os.path.normpath(d)
+            if d not in seen:
+                seen.add(d)
+                uniq.append(d)
+
+        for d in uniq:
+            setting_path = os.path.join(d, "settings")
+            if not os.path.exists(setting_path):
+                continue
             for enc in ("utf-8", "utf-8-sig"):
                 try:
-                    with open(setting_path, 'r', encoding=enc) as f:
+                    with open(setting_path, "r", encoding=enc) as f:
                         return json.load(f)
                 except Exception:
                     continue
-            return None
-        else:
-            return None
+        return None
 
     def start_ocr_server(self):
         # 啓動實時識別
@@ -337,10 +372,20 @@ class ImageProcessServer:
                 self.logger.info("\n服务器已停止")
 
 
-def run(host="localhost", port=30415):
+def run_legacy(host="localhost", port=30415):
     imgProcess = ImageProcessServer()
     imgProcess.start_server(host=host, port=port)
 
+
+def run(host="localhost", port=30415):
+    # New default: supervisor mode (OCR + compare in separate worker processes).
+    from server_supervisor import run as run_supervisor
+
+    run_supervisor(host=host, port=port)
+
 if __name__ == "__main__":
-    run("127.0.0.1")
+    if "--legacy" in os.sys.argv:
+        run_legacy("127.0.0.1")
+    else:
+        run("127.0.0.1")
 
